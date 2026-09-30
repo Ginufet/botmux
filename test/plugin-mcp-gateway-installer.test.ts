@@ -130,6 +130,78 @@ describe('plugin MCP Gateway installer', () => {
     expect(removeGatewayEntry(adapter).state).toBe('absent');
   });
 
+  it.each(['\n', '\r\n'])('keeps tables after the gateway block that are not recognizable headers (%j)', (newline) => {
+    const path = join(home, '.codex', 'config.toml');
+    mkdirSync(dirname(path), { recursive: true });
+    const adapter = { id: 'codex', mcpGateway: { format: 'codex-toml' as const, configPath: path } };
+    // After the first install the gateway block typically ends the file, so
+    // everything Codex appends afterwards lands BELOW the markers. None of these
+    // shapes may be swallowed by the owned-table remover:
+    //  - a comment introducing the next table is the next table's, not ours;
+    //  - [[array-of-tables]] is a TOML header but never an mcp_servers table;
+    //  - a `]` inside a quoted key must not be read as the header terminator.
+    const trailing = [
+      '# disable a skill in the Codex TUI',
+      '[[skills.config]]',
+      'name = "skill-a"',
+      'enabled = false',
+      '[hooks.state."/tmp/we]ird/hooks.json:stop:0:0"]',
+      'trusted_hash = "sha256:bracket-key"',
+      '[hooks.state."/tmp/plain/hooks.json:stop:0:0"]',
+      'trusted_hash = "sha256:plain-key"',
+    ].join('\n');
+    const initial = [
+      'model = "test-model"',
+      '# >>> botmux mcp gateway',
+      '[mcp_servers.botmux]',
+      'command = "old-gateway"',
+      '# <<< botmux mcp gateway',
+      trailing,
+      '',
+    ].join('\n').replace(/\n/g, newline);
+
+    writeFileSync(path, initial);
+    expect(ensureGatewayEntry(adapter).state).toBe('installed');
+    const updated = readFileSync(path, 'utf8');
+    expect(updated).toContain('# disable a skill in the Codex TUI');
+    expect(updated).toContain('[[skills.config]]');
+    expect(updated).toContain('trusted_hash = "sha256:bracket-key"');
+    expect(updated).toContain('trusted_hash = "sha256:plain-key"');
+    expect(updated).not.toContain('old-gateway');
+    expect(updated.match(/\[mcp_servers\.botmux\]/g)).toHaveLength(1);
+    expect(ensureGatewayEntry(adapter).state).toBe('unchanged');
+
+    // Same preservation contract on the removal path.
+    writeFileSync(path, initial);
+    expect(removeGatewayEntry(adapter).state).toBe('removed');
+    const removed = readFileSync(path, 'utf8');
+    expect(removed).toContain('[[skills.config]]');
+    expect(removed).toContain('trusted_hash = "sha256:bracket-key"');
+    expect(removed).toContain('trusted_hash = "sha256:plain-key"');
+    expect(removed).not.toContain('mcp_servers.botmux');
+    expect(removed).not.toContain('botmux mcp gateway');
+  });
+
+  it('replaces a handwritten single-quoted botmux table instead of duplicating it', () => {
+    const path = join(home, '.codex', 'config.toml');
+    mkdirSync(dirname(path), { recursive: true });
+    const adapter = { id: 'codex', mcpGateway: { format: 'codex-toml' as const, configPath: path } };
+    // [mcp_servers.'botmux'] and [mcp_servers.botmux] are the SAME TOML table.
+    // Leaving the handwritten one in place while appending ours produced a
+    // "duplicate table" file that Codex could not parse.
+    writeFileSync(path, [
+      "[mcp_servers.'botmux']",
+      'command = "handwritten"',
+      '',
+    ].join('\n'));
+    expect(ensureGatewayEntry(adapter).state).toBe('installed');
+    const updated = readFileSync(path, 'utf8');
+    expect(updated).not.toContain("'botmux'");
+    expect(updated).not.toContain('handwritten');
+    expect(updated.match(/mcp_servers\.(?:'botmux'|"botmux"|botmux)/g)).toHaveLength(1);
+    expect(ensureGatewayEntry(adapter).state).toBe('unchanged');
+  });
+
   it('merges and removes only the owned Claude gateway entry', () => {
     const path = join(home, '.claude.json');
     writeFileSync(path, JSON.stringify({ mcpServers: { keep: { command: 'keep' } }, theme: 'dark' }));
